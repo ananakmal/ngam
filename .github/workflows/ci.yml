@@ -32,6 +32,6 @@ jobs:
           pip install -e .
           pip install pytest
 
-      - name: Run unit tests (Mock & Contract Suite)
+      - name: Run test suite
         run: |
-          python -m pytest tests/test_ngam.py -v -k "not real_model"
+          python -m pytest tests/test_ngam.py -v

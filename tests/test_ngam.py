@@ -238,17 +238,25 @@ def test_decision_result_serialization():
 # 4. Model Downloader & Offline Cache Tests (Tests 15-16)
 # ============================================================================
 
-def test_downloader_cached_offline():
+def test_downloader_cached_offline(tmp_path):
     """Test 15: Verify offline mode succeeds when local or dev cache assets are present."""
-    assert is_model_available(DEFAULT_MODEL_DIR) is True
-    validated_path = ensure_model(model_dir=DEFAULT_MODEL_DIR, offline_mode=True)
+    dummy_dir = tmp_path / "dummy_model"
+    dummy_tok_dir = dummy_dir / "tokenizer"
+    dummy_tok_dir.mkdir(parents=True, exist_ok=True)
+    for filename in ["model.onnx", "model.onnx.data", "rl_agent_config.json"]:
+        (dummy_dir / filename).write_bytes(b"dummy")
+    (dummy_tok_dir / "tokenizer.json").write_bytes(b"dummy")
+
+    assert is_model_available(str(dummy_dir)) is True
+    validated_path = ensure_model(model_dir=str(dummy_dir), offline_mode=True)
     assert os.path.isdir(validated_path)
 
 
-def test_downloader_offline_failure_on_missing():
+def test_downloader_offline_failure_on_missing(tmp_path):
     """Test 16: Verify offline mode raises FileNotFoundError when required assets are absent."""
+    missing_dir = str(tmp_path / "non_existent_model_dir_9999")
     with pytest.raises(FileNotFoundError):
-        ensure_model(model_dir="c:/dev/ngam/non_existent_model_dir_9999", offline_mode=True)
+        ensure_model(model_dir=missing_dir, offline_mode=True)
 
 
 # ============================================================================
@@ -384,7 +392,9 @@ def test_daemon_server_health_cors_and_decide():
     """Test 21: Verify daemon /healthz, OPTIONS 204 CORS headers, /v1/decide, and shutdown."""
     from ngam.daemon import create_server
 
-    decider = UniversalDecider(preferred_provider="cpu")
+    mock_sess = MockInferenceSession(logits=np.array([[2.0, 1.0, -1.0]]))
+    mock_tok = MockTokenizer()
+    decider = UniversalDecider(custom_session=mock_sess, custom_tokenizer=mock_tok)
     port = 8049
     server = create_server("127.0.0.1", port, decider=decider)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -432,6 +442,7 @@ def test_daemon_server_health_cors_and_decide():
 # 7. Real Model E2E Spectrum Tests (Test 22)
 # ============================================================================
 
+@pytest.mark.skipif(not is_model_available(), reason="Real model weights not cached in CI runner")
 def test_real_model_e2e_full_spectrum():
     """Test 22: Full end-to-end inference evaluating Choice, Score, and Noul routing."""
     decider = Decider(preferred_provider="cpu")
