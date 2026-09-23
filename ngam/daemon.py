@@ -86,7 +86,7 @@ class DecisionHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json_response(200, {
                 "status": "ok",
                 "provider": decider.active_provider,
-                "model": getattr(decider, "model_name", "laya-onnx"),
+                "model": getattr(decider, "model_name", "ngam-onnx"),
                 "warm": True,
             })
         else:

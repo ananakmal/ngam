@@ -224,7 +224,7 @@ def test_decision_result_serialization():
         decision=choice,
         latency_ms=4.2,
         provider="CPUExecutionProvider",
-        model_name="laya-onnx",
+        model_name="ngam-onnx",
         tokens_used=5,
     )
     json_str = res.model_dump_json()

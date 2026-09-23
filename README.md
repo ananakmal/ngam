@@ -286,7 +286,7 @@ curl -s http://127.0.0.1:8045/healthz
 {
   "status": "ok",
   "provider": "DmlExecutionProvider",
-  "model": "laya-onnx",
+  "model": "ngam-onnx",
   "warm": true
 }
 ```
@@ -328,7 +328,7 @@ curl -X POST http://127.0.0.1:8045/v1/decide \
   },
   "latency_ms": 4.12,
   "provider": "DmlExecutionProvider",
-  "model_name": "laya-onnx",
+  "model_name": "ngam-onnx",
   "tokens_used": 15,
   "is_ambiguous": false,
   "is_out_of_domain": false,
@@ -360,7 +360,7 @@ curl http://localhost:8045/healthz
 - **Backbone Architecture**: ModernBERT-large (421M parameters) with custom bidirectional sequence classification heads.
 - **Quantization**: INT8 calibrated ONNX runtime graph (`~210MB` disk footprint).
 - **Context Length**: Up to 512 tokens (192 tokens reserved for question and candidate option descriptions).
-- **Storage Location**: `~/.cache/ngam/models/laya_onnx/`
+- **Storage Location**: `~/.cache/ngam/models/ngam_onnx/`
 - **100% Offline & Private**: Zero telemetry, zero external network calls during inference. Data never leaves your machine.
 
 ---
@@ -375,8 +375,6 @@ python -m pytest tests/test_ngam.py -v
 
 ---
 
-## 📄 License & Credits
+## 📄 License
 
 Released under the **MIT License**. Copyright (c) 2026 **Anan Akmal**.
-
-Developed with inspiration from the Jev/Laya decision architecture.

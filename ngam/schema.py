@@ -199,7 +199,7 @@ class DecisionResult(BaseModel):
     )
     latency_ms: float = Field(default=0.0, ge=0.0, description="Total forward pass and decoding latency in ms")
     provider: str = Field(default="CPUExecutionProvider", description="ONNX execution provider utilized")
-    model_name: str = Field(default="laya-onnx", description="Model architecture identifier")
+    model_name: str = Field(default="ngam-onnx", description="Model architecture identifier")
     tokens_used: int = Field(default=0, ge=0, description="Total sequence tokens processed")
     is_ambiguous: bool = Field(default=False, description="Flag indicating if the primary decision is ambiguous")
     is_out_of_domain: bool = Field(default=False, description="Whether the decision was flagged as out-of-domain")

@@ -102,7 +102,7 @@ def resolve_providers(preferred: Optional[str] = None) -> List[str]:
 
 class UniversalDecider:
     """
-    Universal High-Performance Neural Decision Engine wrapping Laya ONNX runtime.
+    Universal High-Performance Neural Decision Engine wrapping ngam ONNX runtime.
     Supports single or multi-head evaluation:
       - Choice[T]: Categorical routing & multi-class selection
       - Score[Min, Max]: Calibrated ordinal rating & continuous evaluation
@@ -122,7 +122,7 @@ class UniversalDecider:
         Initialize the Universal Decision Engine.
         
         Args:
-            model_dir: Directory containing model weights (defaults to ~/.cache/ngam/models/laya_onnx)
+            model_dir: Directory containing model weights (defaults to ~/.cache/ngam/models/ngam_onnx)
             preferred_provider: Explicit provider override ('dml', 'coreml', 'cuda', 'cpu')
             offline_mode: Disallow Hugging Face downloads if assets are missing
             custom_session: Optional pre-initialized ONNX session (useful for mocks/tests)
@@ -157,7 +157,7 @@ class UniversalDecider:
             self._load_config()
             self._load_tokenizer()
 
-        self.model_name = self.config.get("model_name", "laya-onnx")
+        self.model_name = self.config.get("model_name", "ngam-onnx")
         # Cache special tokens BEFORE initializing session so pre-flight verification can use them
         if self.tokenizer is not None:
             self.cls_id = self.tokenizer.token_to_id("[CLS]")
@@ -290,7 +290,7 @@ class UniversalDecider:
         options: Sequence[Tuple[str, str]],
     ) -> Tuple[List[int], List[int]]:
         """
-        Build the Laya sequence structure:
+        Build the ngam sequence structure:
           [CLS] <qtype> question: <question> [SEP]
           [MASK] opt0 [MASK] opt1 ... [SEP]
           <prompt> [SEP]
@@ -581,7 +581,7 @@ class UniversalDecider:
                 decision=res,
                 latency_ms=res.latency_ms,
                 provider=res.provider,
-                model_name=self.config.get("model_name", "laya-onnx"),
+                model_name=self.config.get("model_name", "ngam-onnx"),
                 tokens_used=len(self.tokenize(prompt)) if self.tokenizer else 0,
                 is_ambiguous=res.ambiguous,
                 is_out_of_domain=res.is_out_of_domain,
@@ -616,7 +616,7 @@ class UniversalDecider:
                 decision=res,
                 latency_ms=res.latency_ms,
                 provider=res.provider,
-                model_name=self.config.get("model_name", "laya-onnx"),
+                model_name=self.config.get("model_name", "ngam-onnx"),
                 tokens_used=len(self.tokenize(prompt)) if self.tokenizer else 0,
                 is_ambiguous=res.ambiguous,
                 is_out_of_domain=res.is_out_of_domain,
@@ -630,7 +630,7 @@ class UniversalDecider:
                 decision=res,
                 latency_ms=res.latency_ms,
                 provider=res.provider,
-                model_name=self.config.get("model_name", "laya-onnx"),
+                model_name=self.config.get("model_name", "ngam-onnx"),
                 tokens_used=len(self.tokenize(prompt)) if self.tokenizer else 0,
                 is_ambiguous=res.ambiguous,
                 is_out_of_domain=res.is_out_of_domain,

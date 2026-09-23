@@ -19,11 +19,12 @@ logger = logging.getLogger("ngam.downloader")
 DEFAULT_REPO_ID = "inferenceprince/laya-onnx-int8"
 FALLBACK_REPO_ID = "inferenceprince/laya-onnx"
 
-# Default standalone cache directory: ~/.cache/ngam/models/laya_onnx
-DEFAULT_CACHE_DIR = (Path.home() / ".cache" / "ngam" / "models" / "laya_onnx").resolve()
+# Default standalone cache directory: ~/.cache/ngam/models/ngam_onnx
+DEFAULT_CACHE_DIR = (Path.home() / ".cache" / "ngam" / "models" / "ngam_onnx").resolve()
 DEFAULT_MODEL_DIR = str(DEFAULT_CACHE_DIR)
 
-# Local development fallback location
+# Local fallback sources
+LEGACY_CACHE_DIR = (Path.home() / ".cache" / "ngam" / "models" / "laya_onnx").resolve()
 LOCAL_DEV_DIR = Path("c:/dev/dev/models/laya_onnx")
 
 REQUIRED_FILES = [
@@ -81,17 +82,19 @@ def _sync_from_local_source(src_dir: Path, target_dir: Path) -> bool:
 def is_model_available(model_dir: Optional[str] = None) -> bool:
     """
     Check whether all critical ONNX model and tokenizer assets exist locally.
-    Auto-links from c:/dev/dev/models/laya_onnx if target is default cache.
+    Auto-links from existing local model caches if target is default cache.
     """
     target = Path(model_dir or os.environ.get("NGAM_MODEL_DIR") or os.environ.get("AGY_DECIDE_MODEL_DIR") or DEFAULT_CACHE_DIR).resolve()
     
     if _has_required_files(target):
         return True
 
-    # If checking the default cache and it is not yet populated, check local dev source
-    if target == DEFAULT_CACHE_DIR and LOCAL_DEV_DIR.is_dir() and _has_required_files(LOCAL_DEV_DIR):
-        if _sync_from_local_source(LOCAL_DEV_DIR, target):
-            return True
+    # If checking the default cache and it is not yet populated, check local fallback sources
+    if target == DEFAULT_CACHE_DIR:
+        for candidate in [LEGACY_CACHE_DIR, LOCAL_DEV_DIR]:
+            if candidate.is_dir() and _has_required_files(candidate):
+                if _sync_from_local_source(candidate, target):
+                    return True
 
     return False
 
@@ -103,11 +106,11 @@ def ensure_model(
     offline_mode: bool = False,
 ) -> str:
     """
-    Ensure the Laya ONNX model weights, tokenizer, and calibration configs are available.
+    Ensure the ngam ONNX model weights, tokenizer, and calibration configs are available.
     
     Args:
-        model_dir: Directory where model weights are stored (default ~/.cache/ngam/models/laya_onnx).
-        repo_id: Hugging Face repository id (default: 'inferenceprince/laya-onnx-int8').
+        model_dir: Directory where model weights are stored (default ~/.cache/ngam/models/ngam_onnx).
+        repo_id: Hugging Face repository id (defaults to DEFAULT_REPO_ID).
         force_download: If True, re-download assets even if present.
         offline_mode: If True, never attempt network requests; error if assets are missing.
         
@@ -122,11 +125,13 @@ def ensure_model(
             logger.info(f"Using cached ngam model from: {target} (offline ready)")
             return str(target)
 
-        # Check local dev source only when targeting default cache dir
-        if target == DEFAULT_CACHE_DIR and LOCAL_DEV_DIR.is_dir() and _has_required_files(LOCAL_DEV_DIR):
-            logger.info(f"Populating cache from local dev source: {LOCAL_DEV_DIR} -> {target}")
-            if _sync_from_local_source(LOCAL_DEV_DIR, target):
-                return str(target)
+        # Check local fallback sources only when targeting default cache dir
+        if target == DEFAULT_CACHE_DIR:
+            for candidate in [LEGACY_CACHE_DIR, LOCAL_DEV_DIR]:
+                if candidate.is_dir() and _has_required_files(candidate):
+                    logger.info(f"Populating cache from local source: {candidate} -> {target}")
+                    if _sync_from_local_source(candidate, target):
+                        return str(target)
 
     if offline_mode:
         raise FileNotFoundError(
