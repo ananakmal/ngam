@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ngam"
+version = "1.0.0"
+description = "Ultra-fast typed neural decision engine. Sub-5ms probabilistic routing across Windows, macOS & Linux."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Anan Akmal" }]
+keywords = ["decision-engine", "routing", "onnx", "shannon-entropy", "system-1", "directml", "coreml", "ai-agents"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+    "onnxruntime>=1.17.0",
+    "tokenizers>=0.15.0",
+    "pydantic>=2.0.0",
+    "numpy>=1.24.0",
+    "huggingface_hub>=0.20.0"
+]
+
+[project.optional-dependencies]
+directml = ["onnxruntime-directml>=1.17.0"]
+cuda = ["onnxruntime-gpu>=1.17.0"]
+
+[project.scripts]
+ngam = "ngam.cli:main"
+ngam-daemon = "ngam.daemon:main"
