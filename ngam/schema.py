@@ -67,7 +67,8 @@ def compute_normalized_entropy(probabilities: Union[Sequence[float], np.ndarray]
 def is_high_entropy(
     probabilities: Union[Sequence[float], np.ndarray],
     threshold_ratio: float = 0.85,
-    min_margin: float = 0.05
+    min_margin: float = 0.05,
+    min_confidence_floor: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Determine if a probability distribution is high-entropy (ambiguous / Out-Of-Distribution).
@@ -76,6 +77,7 @@ def is_high_entropy(
         probabilities: Sequence or array of probabilities.
         threshold_ratio: Normalized entropy cutoff (default 0.85).
         min_margin: Minimum probability gap between top 2 candidates (default 0.05).
+        min_confidence_floor: Minimum probability floor required for top candidate (default max(0.30, 1.25 / k)).
         
     Returns:
         (is_ambiguous, reason_description)
@@ -103,6 +105,13 @@ def is_high_entropy(
         return (
             True,
             f"Narrow candidate separation (top1={top1:.3f}, top2={top2:.3f}, margin={margin:.3f} < {min_margin:.2f}); decision is ambiguous."
+        )
+        
+    floor = min_confidence_floor if min_confidence_floor is not None else max(0.30, 1.25 / k)
+    if top1 < floor:
+        return (
+            True,
+            f"Low winner confidence (top1={top1:.1%} < floor={floor:.1%}); decision lacks decisiveness."
         )
         
     return False, None

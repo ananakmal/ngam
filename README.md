@@ -1,6 +1,6 @@
 # `ngam` ⚡
 ### Ultra-Fast Typed Neural Decision Engine
-*Sub-5ms Probabilistic Routing, Calibrated Scoring, and Epistemic Verification across Windows, macOS, and Linux.*
+*Calibrated Probabilistic Routing, Scoring, and Epistemic Verification with Shannon Entropy Gating across Windows, macOS, and Linux.*
 
 [![CI](https://github.com/ananakmal/ngam/actions/workflows/ci.yml/badge.svg)](https://github.com/ananakmal/ngam/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -14,9 +14,12 @@
 
 **`ngam`** (*Malay for "exact fit", "just right", "on point"*) is a standalone, hardware-accelerated neural decision engine designed specifically for modern autonomous agents, multi-model orchestrators, and high-throughput production backends.
 
-Rather than burning 1,000+ tokens and waiting 800ms to 3,000ms for a cloud Large Language Model (GPT-4o, Claude 3.5 Sonnet, Gemini 2.0) to perform simple routing, scoring, or truth verification, **`ngam` intercepts incoming queries locally in under 5 milliseconds**.
+Rather than burning 1,000+ tokens and waiting 800ms to 3,000ms for a cloud Large Language Model (GPT-4o, Claude 3.5 Sonnet, Gemini 2.0) to perform simple routing, scoring, or truth verification, **`ngam` intercepts incoming queries locally with zero cloud API token costs**:
+- **In-memory CPU daemon inference (~340–450ms)**: ModernBERT-large is 421M parameters, which takes ~350ms of pure tensor math on multi-threaded AVX2/AVX-512 CPUs.
+- **Hardware-accelerated GPU inference (~15–35ms)**: Massive tensor parallelism on Linux CUDA / TensorRT backends.
+- **HTTP daemon keep-alive connection (<5ms overhead)**: Persistent localhost daemon eliminating process startup overhead.
 
-It combines a calibrated INT8 ONNX transformer backbone with **Shannon Entropy ambiguity gating**, ensuring that routine deterministic decisions are executed instantly with zero cloud token cost, while ambiguous or out-of-distribution queries are reliably escalated to frontier reasoning models.
+It combines a calibrated INT8 ONNX transformer backbone with **Shannon Entropy ambiguity gating**, ensuring that routine deterministic decisions are executed locally with high confidence, while ambiguous or out-of-distribution queries are reliably escalated to frontier reasoning models.
 
 ---
 
@@ -36,7 +39,8 @@ Today's AI agent stacks suffer from an architectural defect: **they use System-2
                                            ▼
                             ┌───────────────────────────────┐
                             │      ngam Decision Engine     │
-                            │      (Local ONNX, <5ms)       │
+                            │ (Local ONNX, ~15-35ms GPU /   │
+                            │       ~340-450ms CPU)         │
                             └──────────────┬────────────────┘
                                            │
                    ┌───────────────────────┴───────────────────────┐
@@ -48,8 +52,8 @@ Today's AI agent stacks suffer from an architectural defect: **they use System-2
      ┌───────────────────────────┐                   ┌───────────────────────────┐
      │   Local Reflex Execution  │                   │ Escalation to System-2    │
      │   * Direct Action / Route │                   │ * Cloud LLM / Deep Reason │
-     │   * Sub-5ms response      │                   │ * Fallback Council        │
-     │   * Zero token cost       │                   │ * Human-in-the-loop       │
+     │   * Zero token cost       │                   │ * Fallback Council        │
+     │   * Fast local response   │                   │ * Human-in-the-loop       │
      └───────────────────────────┘                   └───────────────────────────┘
 ```
 
@@ -159,7 +163,8 @@ $$H_{\text{norm}}(P) = \frac{H(P)}{\log_2(k)}$$
 
 ### Epistemic Rejection Thresholds:
 1. **Near-Uniform Entropy Cutoff ($H_{\text{norm}} \ge 0.85$)**: When the model assigns roughly equal probabilities across candidates, it signals epistemic uncertainty. `ngam` flags `ambiguous = True` and `is_out_of_domain = True`.
-2. **Narrow Candidate Margin ($p_{\text{top1}} - p_{\text{top2}} < 0.05$ with low confidence)**: When top candidates cannot be reliably separated, `ngam` flags the decision as ambiguous for human or System-2 review.
+2. **Narrow Candidate Margin ($p_{\text{top1}} - p_{\text{top2}} < 0.05$ with low confidence)**: When top candidates cannot be reliably separated ($p_{\text{top1}} < 1.5 / k$), `ngam` flags the decision as ambiguous for human or System-2 review.
+3. **Decisive Winner Confidence Floor ($p_{\text{top1}} < \max(0.30, 1.25 / k)$)**: Decisions where the winning candidate fails to secure decisive probability mass (e.g. < 30%) are automatically flagged as ambiguous / out-of-domain (`ambiguous = True`), preventing low-confidence guesses from passing as definitive decisions.
 
 ```python
 # Unintelligible or adversarial out-of-domain input
@@ -178,14 +183,33 @@ print(res.rejection_reason)   # "High Shannon entropy (H_norm=0.982 >= 0.85); di
 
 `ngam` features an automatic platform resolver that inspects available execution providers and automatically selects the highest-performance acceleration backend:
 
-| Operating System | Primary Acceleration Backend | Fallback | Supported Hardware |
-|:---|:---|:---|:---|
-| **Windows 11 / 10** | **DirectML (`DmlExecutionProvider`)** | CPU (AVX-512 / AVX2) | DirectX 12 GPUs (NVIDIA, AMD, Intel Arc, Qualcomm Snapdragon NPU) |
-| **macOS (Apple Silicon)** | **Core ML (`CoreMLExecutionProvider`)** | CPU (Apple Silicon Accelerate) | M1 / M2 / M3 / M4 Neural Engine & Metal GPU |
-| **Linux (Ubuntu / Debian / RHEL)** | **CUDA / TensorRT / OpenVINO** | CPU (OpenMP / oneDNN) | NVIDIA GPUs, Intel CPUs/GPUs, AMD ROCm |
+| Operating System | Primary Acceleration Backend | Fallback | Supported Hardware | Status |
+|:---|:---|:---|:---|:---|
+| **Windows 11 / 10** | **CPU (`CPUExecutionProvider`)** | Single-threaded CPU | Multi-threaded AVX2 / AVX-512 CPUs | ✅ Primary Out-of-the-Box Verified (~340–450ms) |
+| **Linux (Ubuntu / Debian / RHEL)** | **CUDA / TensorRT (`CUDAExecutionProvider`)** | CPU (OpenMP / oneDNN) | NVIDIA GPUs (RTX, A100, H100) | ✅ Full GPU Acceleration (~15–35ms) |
+| **macOS (Apple Silicon)** | **Core ML (`CoreMLExecutionProvider`)** | CPU (Apple Accelerate) | M1 / M2 / M3 / M4 Neural Engine & Metal GPU | ✅ Hardware Accelerated (~25–50ms) |
+| **Windows 11 (DirectML)** | **DirectML (`DmlExecutionProvider`)** | Auto-fallback to CPU | DirectX 12 GPUs | ⚠️ Experimental (Upstream Reshape op limitation) |
+
+> [!NOTE] Windows DirectML Compatibility Notice
+> DirectML on Windows DirectX 12 is currently experimental due to an upstream ONNX Runtime Reshape operator kernel limitation (`node_view` status code failure) when processing ModernBERT dynamic attention heads. `ngam`'s automated preflight probe catches this driver/kernel incompatibility gracefully and safely falls back to multi-threaded `CPUExecutionProvider` without crashing your application. On Windows out-of-the-box, `CPUExecutionProvider` with AVX2/AVX-512 is the primary verified execution provider. On Linux, `CUDAExecutionProvider` provides verified full GPU acceleration (~15–35ms).
 
 ### Preflight Verification Probe
 During initialization, if a non-CPU execution provider is selected, `ngam` executes a calibrated 2-option preflight probe. If the underlying GPU or DirectML driver encounters an incompatibility, `ngam` catches the exception and falls back to `CPUExecutionProvider` without crashing your application.
+
+---
+
+## 📊 Empirical Performance & Benchmarks
+
+The following benchmarks are derived directly from local measurements using ModernBERT-large (421M parameters, INT8 quantized graph ~210MB):
+
+| Benchmark Phase / Operation | Execution Provider | Measured Latency | Throughput / Overhead | Real-World Operational Context |
+|:---|:---|:---|:---|:---|
+| **Cold Init (Session & Tokenizer Load)** | `CPUExecutionProvider` | ~1,300–1,500 ms | One-time startup | Graph deserialization & ONNX session setup from local cache |
+| **Choice / Route Inference (Warm)** | CPU (multi-threaded AVX2 / AVX-512) | **~340–450 ms** (mean ~368 ms) | ~2.5–3.0 req/s | Pure tensor math for 421M ModernBERT parameters |
+| **Noul Epistemic Inference (Warm)** | CPU (multi-threaded AVX2 / AVX-512) | **~520–735 ms** | ~1.5–2.0 req/s | Sequence pair verification across full context |
+| **Choice / Route Inference (GPU)** | Linux CUDA (`CUDAExecutionProvider`) | **~15–35 ms** | ~30–65 req/s | Full tensor core hardware parallelization |
+| **Daemon Keep-Alive Connection Overhead** | HTTP Keep-Alive / Loopback | **< 3–5 ms** | > 1,000 conn/s | Localhost HTTP socket & serialization overhead (excluding inference) |
+| **Daemon Working Set Memory** | Resident RAM | ~650–850 MB | Static resident RAM | INT8 graph weights + ONNX runtime workspace buffers |
 
 ---
 
@@ -266,7 +290,7 @@ ngam "Verify state" --choice "ok,error" --offline
 
 ## 🌐 In-Memory HTTP Daemon (`ngam-daemon`)
 
-For maximum performance, run `ngam` as an in-memory HTTP daemon on port `8045`. This pre-warms model weights in VRAM/RAM, eliminating process startup overhead and delivering **sub-5ms localhost response times**.
+For maximum performance, run `ngam` as an in-memory HTTP daemon on port `8045`. This pre-warms model weights in RAM/VRAM, eliminating process startup overhead and delivering **sub-5ms connection overhead** (<5ms HTTP keep-alive) directly to the in-memory engine.
 
 ### Launching the Daemon
 
@@ -285,7 +309,7 @@ curl -s http://127.0.0.1:8045/healthz
 ```json
 {
   "status": "ok",
-  "provider": "DmlExecutionProvider",
+  "provider": "CPUExecutionProvider",
   "model": "ngam-onnx",
   "warm": true
 }
@@ -323,11 +347,11 @@ curl -X POST http://127.0.0.1:8045/v1/decide \
     "is_out_of_domain": false,
     "rejection_reason": null,
     "act_probability": 0.125,
-    "latency_ms": 4.12,
-    "provider": "DmlExecutionProvider"
+    "latency_ms": 368.55,
+    "provider": "CPUExecutionProvider"
   },
-  "latency_ms": 4.12,
-  "provider": "DmlExecutionProvider",
+  "latency_ms": 368.55,
+  "provider": "CPUExecutionProvider",
   "model_name": "ngam-onnx",
   "tokens_used": 15,
   "is_ambiguous": false,

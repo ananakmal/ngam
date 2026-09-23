@@ -134,6 +134,25 @@ def test_is_high_entropy_detection():
     assert ambiguous is True
     assert "Narrow candidate separation" in reason
 
+    # Low winner confidence floor (top1 < max(0.30, 1.25 / k)) -> ambiguous
+    low_conf = [0.26, 0.20, 0.16, 0.14, 0.12, 0.12]
+    ambiguous, reason = is_high_entropy(low_conf, threshold_ratio=0.99, min_margin=0.05)
+    assert ambiguous is True
+    assert "Low winner confidence" in reason
+    assert "floor=30.0%" in reason
+
+    # Custom winner confidence floor
+    custom_conf = [0.55, 0.25, 0.20]
+    ambiguous, reason = is_high_entropy(custom_conf, threshold_ratio=0.99, min_margin=0.05, min_confidence_floor=0.60)
+    assert ambiguous is True
+    assert "Low winner confidence" in reason
+    assert "floor=60.0%" in reason
+
+    # Sufficient confidence floor -> NOT ambiguous
+    ambiguous, reason = is_high_entropy(custom_conf, threshold_ratio=0.99, min_margin=0.05, min_confidence_floor=0.50)
+    assert ambiguous is False
+    assert reason is None
+
 
 # ============================================================================
 # 3. Pydantic V2 Schema Contracts Tests (Tests 9-14)
