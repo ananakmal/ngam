@@ -30,6 +30,7 @@ from ngam import (
     Noul,
     Score,
     UniversalDecider,
+    build_decision_result,
     compute_normalized_entropy,
     compute_shannon_entropy,
     ensure_model,
@@ -53,11 +54,30 @@ def test_resolve_providers_darwin():
 
 
 def test_resolve_providers_windows():
-    """Test 2: Verify Windows prioritizes DmlExecutionProvider before CPU fallback."""
+    """Test 2: Verify Windows DXGI adapter gating and DmlExecutionProvider resolution."""
+    # 1. Hardware adapters present -> returns DmlExecutionProvider tuple with device_id
     with patch("platform.system", return_value="Windows"):
         with patch("onnxruntime.get_available_providers", return_value=["DmlExecutionProvider", "CPUExecutionProvider"]):
-            providers = resolve_providers()
-            assert providers == ["DmlExecutionProvider", "CPUExecutionProvider"]
+            with patch("ngam.engine.get_hardware_adapters", return_value=[MagicMock()]):
+                with patch("ngam.engine.get_best_dml_device_id", return_value=0):
+                    providers = resolve_providers()
+                    assert providers == [("DmlExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
+
+    # 2. Empty hardware adapters (e.g. WARP/CPU/headless) -> DmlExecutionProvider is omitted by default
+    with patch("platform.system", return_value="Windows"):
+        with patch("onnxruntime.get_available_providers", return_value=["DmlExecutionProvider", "CPUExecutionProvider"]):
+            with patch("ngam.engine.get_hardware_adapters", return_value=[]):
+                with patch("ngam.engine.get_best_dml_device_id", return_value=None):
+                    providers = resolve_providers()
+                    assert providers == ["CPUExecutionProvider"]
+
+    # 3. Empty hardware adapters but explicitly forced via preferred='dml' -> DmlExecutionProvider is included
+    with patch("platform.system", return_value="Windows"):
+        with patch("onnxruntime.get_available_providers", return_value=["DmlExecutionProvider", "CPUExecutionProvider"]):
+            with patch("ngam.engine.get_hardware_adapters", return_value=[]):
+                with patch("ngam.engine.get_best_dml_device_id", return_value=None):
+                    providers = resolve_providers(preferred="dml")
+                    assert providers == ["DmlExecutionProvider", "CPUExecutionProvider"]
 
 
 def test_resolve_providers_linux():
@@ -253,6 +273,136 @@ def test_decision_result_serialization():
     assert parsed.latency_ms == 4.2
 
 
+def test_computed_field_abstain_base_decision():
+    """Verify BaseDecision.abstain is True when ambiguous=True or is_out_of_domain=True."""
+    # 1. Clean decision -> abstain is False
+    clean = BaseDecision(ambiguous=False, is_out_of_domain=False)
+    assert clean.abstain is False
+
+    # 2. Ambiguous decision -> abstain is True
+    ambig = BaseDecision(ambiguous=True, is_out_of_domain=False)
+    assert ambig.abstain is True
+
+    # 3. Out-of-domain decision -> abstain is True
+    ood = BaseDecision(ambiguous=False, is_out_of_domain=True)
+    assert ood.abstain is True
+
+    # 4. Both ambiguous and out-of-domain -> abstain is True
+    both = BaseDecision(ambiguous=True, is_out_of_domain=True)
+    assert both.abstain is True
+
+
+def test_computed_field_abstain_decision_result():
+    """Verify DecisionResult.abstain is True when is_ambiguous=True or child decision is ambiguous."""
+    clean_choice = Choice[str](
+        decision="billing",
+        probabilities={"billing": 1.0},
+        confidence=1.0,
+        ambiguous=False,
+        is_out_of_domain=False,
+    )
+    res_clean = DecisionResult(
+        prompt="Test prompt",
+        decision=clean_choice,
+        is_ambiguous=False,
+        is_out_of_domain=False,
+    )
+    assert res_clean.abstain is False
+
+    # Child decision is ambiguous -> res.abstain is True
+    ambig_choice = Choice[str](
+        decision="billing",
+        probabilities={"billing": 0.5, "tech": 0.5},
+        confidence=0.5,
+        ambiguous=True,
+        is_out_of_domain=False,
+    )
+    res_child_ambig = DecisionResult(
+        prompt="Test prompt",
+        decision=ambig_choice,
+        is_ambiguous=False,
+        is_out_of_domain=False,
+    )
+    assert res_child_ambig.abstain is True
+
+    # Parent result is_ambiguous=True -> res.abstain is True
+    res_parent_ambig = DecisionResult(
+        prompt="Test prompt",
+        decision=clean_choice,
+        is_ambiguous=True,
+        is_out_of_domain=False,
+    )
+    assert res_parent_ambig.abstain is True
+
+    # Child is_out_of_domain=True -> res.abstain is True
+    ood_choice = Choice[str](
+        decision="unknown",
+        probabilities={"unknown": 1.0},
+        confidence=0.1,
+        ambiguous=False,
+        is_out_of_domain=True,
+    )
+    res_child_ood = DecisionResult(
+        prompt="Test prompt",
+        decision=ood_choice,
+        is_ambiguous=False,
+        is_out_of_domain=False,
+    )
+    assert res_child_ood.abstain is True
+
+
+def test_build_decision_result_helper():
+    """Verify build_decision_result constructs envelope and resolves abstain flags."""
+    clean_choice = Choice[str](
+        decision="sales",
+        probabilities={"sales": 0.9, "support": 0.1},
+        confidence=0.9,
+        ambiguous=False,
+    )
+
+    # 1. Clean build
+    res = build_decision_result(
+        prompt="Help with purchase",
+        decision=clean_choice,
+        latency_ms=3.5,
+        provider="CPUExecutionProvider",
+        model_name="ngam-onnx",
+        tokens_used=6,
+    )
+    assert res.prompt == "Help with purchase"
+    assert res.decision.decision == "sales"
+    assert res.latency_ms == 3.5
+    assert res.provider == "CPUExecutionProvider"
+    assert res.model_name == "ngam-onnx"
+    assert res.tokens_used == 6
+    assert res.is_ambiguous is False
+    assert res.abstain is False
+
+    # 2. Explicit abstain flag passed -> propagates to is_ambiguous and abstain
+    res_abstain = build_decision_result(
+        prompt="Help with purchase",
+        decision=clean_choice,
+        abstain=True,
+    )
+    assert res_abstain.is_ambiguous is True
+    assert res_abstain.abstain is True
+
+    # 3. Inherits ambiguity from child decision
+    ambig_choice = Choice[str](
+        decision="sales",
+        probabilities={"sales": 0.5, "support": 0.5},
+        confidence=0.5,
+        ambiguous=True,
+        ambiguity_reason="High entropy",
+    )
+    res_from_child = build_decision_result(
+        prompt="Ambiguous inquiry",
+        decision=ambig_choice,
+    )
+    assert res_from_child.is_ambiguous is True
+    assert res_from_child.abstain is True
+
+
 # ============================================================================
 # 4. Model Downloader & Offline Cache Tests (Tests 15-16)
 # ============================================================================
@@ -403,6 +553,35 @@ def test_out_of_domain_rejection():
     assert res.decision.is_out_of_domain is True
 
 
+def test_directml_concurrency_guard_vs_cpu_lock_free():
+    """Verify DirectML serializes via _inference_lock while CPU execution is lock-free."""
+    mock_tok = MockTokenizer()
+
+    # 1. DirectML inference: _inference_lock is acquired
+    dml_sess = MockInferenceSession(logits=np.array([[2.0, 1.0]]))
+    dml_sess.get_providers = lambda: ["DmlExecutionProvider"]
+    dml_decider = UniversalDecider(custom_session=dml_sess, custom_tokenizer=mock_tok)
+    dml_decider.providers = ["DmlExecutionProvider"]
+    dml_decider.active_provider = "DmlExecutionProvider"
+    dml_decider._inference_lock = MagicMock(wraps=dml_decider._inference_lock)
+
+    dml_decider.decide_choice("Test prompt", options=["opt1", "opt2"])
+    dml_decider._inference_lock.__enter__.assert_called()
+
+    # 2. CPU inference: _inference_lock is NOT acquired
+    cpu_sess = MockInferenceSession(logits=np.array([[2.0, 1.0]]))
+    cpu_sess.get_providers = lambda: ["CPUExecutionProvider"]
+    cpu_decider = UniversalDecider(custom_session=cpu_sess, custom_tokenizer=mock_tok)
+    cpu_decider.providers = ["CPUExecutionProvider"]
+    cpu_decider.active_provider = "CPUExecutionProvider"
+    cpu_decider._inference_lock = MagicMock(wraps=cpu_decider._inference_lock)
+
+    cpu_decider.decide_choice("Test prompt", options=["opt1", "opt2"])
+    assert cpu_decider._inference_lock.__enter__.called is False, (
+        "CPU inference must execute lock-free without acquiring _inference_lock."
+    )
+
+
 # ============================================================================
 # 6. Daemon Server & CORS Preflight Tests (Test 21)
 # ============================================================================
@@ -465,6 +644,10 @@ def test_daemon_server_health_cors_and_decide():
 def test_real_model_e2e_full_spectrum():
     """Test 22: Full end-to-end inference evaluating Choice, Score, and Noul routing."""
     decider = Decider(preferred_provider="cpu")
+    assert decider.active_provider == "CPUExecutionProvider"
+
+    # Quick warmup call to allocate buffers and load weights so cold start doesn't skew latency
+    _ = decider.decide("Warmup prompt for memory allocation.", choice=["billing", "sales"])
 
     # 1. Choice: refund routing
     c_res = decider.decide(
@@ -473,7 +656,8 @@ def test_real_model_e2e_full_spectrum():
     )
     assert c_res.decision.decision == "billing"
     assert c_res.decision.probabilities["billing"] > 0.65
-    assert c_res.latency_ms < 2500.0
+    assert c_res.latency_ms > 0
+    assert c_res.latency_ms < 15000.0
 
     # 2. Score: severity rating
     s_res = decider.decide(

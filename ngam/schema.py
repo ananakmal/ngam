@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Generic, List, Literal, Optional, Sequence, Tuple, TypeVar, Union
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 
 def compute_shannon_entropy(probabilities: Union[Sequence[float], np.ndarray], base: float = 2.0) -> float:
@@ -121,9 +121,9 @@ class BaseDecision(BaseModel):
     """Base contract for all ngam decision outputs."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
     
-    type: str = Field(..., description="Decision type indicator: 'choice', 'score', or 'noul'")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Epistemic confidence metric in [0.0, 1.0]")
-    entropy: float = Field(..., ge=0.0, description="Shannon entropy H(P) in bits")
+    type: str = Field(default="choice", description="Decision type indicator: 'choice', 'score', or 'noul'")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="Epistemic confidence metric in [0.0, 1.0]")
+    entropy: float = Field(default=0.0, ge=0.0, description="Shannon entropy H(P) in bits")
     ambiguous: bool = Field(default=False, description="Flag indicating high entropy or out-of-distribution ambiguity")
     ambiguity_reason: Optional[str] = Field(default=None, description="Detailed rationale if ambiguous is True")
     is_out_of_domain: bool = Field(default=False, description="Flag indicating if input is out-of-domain or rejected due to high entropy")
@@ -131,6 +131,12 @@ class BaseDecision(BaseModel):
     act_probability: Optional[float] = Field(default=None, description="Escalation / act head probability if produced")
     latency_ms: float = Field(default=0.0, ge=0.0, description="Inference latency in milliseconds")
     provider: str = Field(default="CPUExecutionProvider", description="ONNX Runtime execution provider utilized")
+    tokens_used: int = Field(default=0, ge=0, description="Total sequence tokens processed")
+
+    @computed_field
+    @property
+    def abstain(self) -> bool:
+        return bool(self.ambiguous or self.is_out_of_domain)
 
 
 T = TypeVar("T")
@@ -213,3 +219,47 @@ class DecisionResult(BaseModel):
     is_ambiguous: bool = Field(default=False, description="Flag indicating if the primary decision is ambiguous")
     is_out_of_domain: bool = Field(default=False, description="Whether the decision was flagged as out-of-domain")
     rejection_reason: Optional[str] = Field(default=None, description="Rejection rationale if out-of-domain")
+
+    @computed_field
+    @property
+    def abstain(self) -> bool:
+        dec_ambig = getattr(self.decision, "ambiguous", False)
+        dec_ood = getattr(self.decision, "is_out_of_domain", False)
+        return bool(self.is_ambiguous or self.is_out_of_domain or dec_ambig or dec_ood)
+
+
+def build_decision_result(
+    prompt: str,
+    decision: Union[Choice[Any], Score, Noul, Any],
+    latency_ms: float = 0.0,
+    provider: str = "CPUExecutionProvider",
+    model_name: str = "ngam-onnx",
+    tokens_used: int = 0,
+    is_ambiguous: Optional[bool] = None,
+    is_out_of_domain: Optional[bool] = None,
+    rejection_reason: Optional[str] = None,
+    abstain: Optional[bool] = None,
+    all_decisions: Optional[Dict[str, Union[Choice[Any], Score, Noul]]] = None,
+) -> DecisionResult:
+    """
+    Construct a DecisionResult envelope, automatically resolving abstain and ambiguity flags.
+    Sets abstain = True whenever is_ambiguous or is_out_of_domain.
+    """
+    dec_ambig = bool(getattr(decision, "ambiguous", False))
+    dec_ood = bool(getattr(decision, "is_out_of_domain", False))
+    ambig = (bool(is_ambiguous) if is_ambiguous is not None else False) or dec_ambig or (bool(abstain) if abstain is not None else False)
+    ood = (bool(is_out_of_domain) if is_out_of_domain is not None else False) or dec_ood
+    rej = rejection_reason if rejection_reason is not None else getattr(decision, "rejection_reason", None)
+
+    return DecisionResult(
+        prompt=prompt,
+        decision=decision,
+        all_decisions=all_decisions,
+        latency_ms=latency_ms,
+        provider=provider,
+        model_name=model_name,
+        tokens_used=tokens_used,
+        is_ambiguous=ambig,
+        is_out_of_domain=ood,
+        rejection_reason=rej,
+    )

@@ -3,6 +3,8 @@ ngam.engine
 ===========
 Universal ONNX Decision Engine powering probabilistic routing, ordinal scoring,
 and epistemic verification across Windows (DirectML), macOS (Core ML), and Linux (CUDA).
+Features DirectML hardware acceleration on Windows, CUDA/CoreML/CPU fallbacks,
+calibrated temperature scaling, and Shannon entropy analysis.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import logging
 import math
 import os
 import platform
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
@@ -21,12 +24,14 @@ import onnxruntime as ort
 from tokenizers import Tokenizer
 
 from ngam.downloader import DEFAULT_MODEL_DIR, ensure_model, is_model_available
+from ngam.dxgi import DXGIAdapterInfo, get_best_dml_device_id, get_hardware_adapters
 from ngam.schema import (
     BaseDecision,
     Choice,
     DecisionResult,
     Noul,
     Score,
+    build_decision_result,
     compute_normalized_entropy,
     compute_shannon_entropy,
     is_high_entropy,
@@ -35,66 +40,95 @@ from ngam.schema import (
 logger = logging.getLogger("ngam.engine")
 
 
-def resolve_providers(preferred: Optional[str] = None) -> List[str]:
+def resolve_providers(preferred: Optional[str] = None) -> List[Union[str, Tuple[str, Dict[str, Any]]]]:
     """
     Probe available ONNX Runtime execution providers and return an optimized priority list.
     Prioritizes platform-native hardware acceleration:
-      - Darwin (macOS): CoreMLExecutionProvider, CPUExecutionProvider
-      - Windows: DmlExecutionProvider, CPUExecutionProvider
-      - Linux: CUDAExecutionProvider, OpenVINOExecutionProvider, CPUExecutionProvider
+      - Windows: DirectML (DmlExecutionProvider) when physical DXGI GPU/NPU adapters exist,
+        or explicitly forced via preferred/env.
+      - macOS (Darwin): CoreMLExecutionProvider.
+      - Linux: CUDAExecutionProvider, OpenVINOExecutionProvider, ROCmExecutionProvider.
+      - CPU fallback: Always CPUExecutionProvider.
+
+    If no hardware DXGI adapters exist (e.g. headless VMs, RDP, WARP software rasterizers),
+    DirectML is omitted by default to avoid the C++ runtime stderr filter warning and 14s startup lag,
+    unless explicitly forced via preferred='dml' or NGAM_PROVIDER='dml'.
     """
     available = ort.get_available_providers()
-    providers: List[str] = []
+    providers: List[Union[str, Tuple[str, Dict[str, Any]]]] = []
 
-    provider_aliases: Dict[str, str] = {
-        "dml": "DmlExecutionProvider",
-        "directml": "DmlExecutionProvider",
-        "coreml": "CoreMLExecutionProvider",
-        "cuda": "CUDAExecutionProvider",
-        "openvino": "OpenVINOExecutionProvider",
-        "cpu": "CPUExecutionProvider",
-        "rocm": "ROCMExecutionProvider",
-        "dmlexecutionprovider": "DmlExecutionProvider",
-        "coremlexecutionprovider": "CoreMLExecutionProvider",
-        "cudaexecutionprovider": "CUDAExecutionProvider",
-        "openvinoexecutionprovider": "OpenVINOExecutionProvider",
-        "cpuexecutionprovider": "CPUExecutionProvider",
-    }
+    # Check environment variable for DML device ID override (integer if set)
+    dml_env_device_id: Optional[int] = None
+    raw_val = os.environ.get("NGAM_DML_DEVICE_ID") or os.environ.get("AGY_DML_DEVICE_ID")
+    if raw_val:
+        raw_val = raw_val.strip()
+        if raw_val:
+            try:
+                dml_env_device_id = int(raw_val)
+            except ValueError:
+                logger.warning(f"Malformed DML device ID='{raw_val}', expected integer.")
 
     env_preferred = os.environ.get("NGAM_PROVIDER") or os.environ.get("AGY_DECIDE_PROVIDER")
     target_preferred = preferred or env_preferred
+    preferred_lower = target_preferred.lower().strip() if target_preferred else None
 
-    if target_preferred:
-        matched = provider_aliases.get(target_preferred.lower(), target_preferred)
-        if matched in available:
-            providers.append(matched)
-        else:
-            logger.warning(f"Preferred provider '{target_preferred}' not found in available: {available}")
+    # Handle explicit preference for CPU
+    if preferred_lower in ("cpu", "cpuexecutionprovider"):
+        return ["CPUExecutionProvider"]
 
-    # Platform-specific native hardware priority list
+    force_dml = preferred_lower in ("dml", "directml", "dmlexecutionprovider")
+    force_cuda = preferred_lower in ("cuda", "cudaexecutionprovider")
+    force_coreml = preferred_lower in ("coreml", "coremlexecutionprovider")
+
     system = platform.system().lower()
+
+    # 1. macOS (Darwin) CoreML Evaluation
     if "darwin" in system:
-        platform_order = [
-            "CoreMLExecutionProvider",
-            "CPUExecutionProvider",
-        ]
-    elif "windows" in system:
-        platform_order = [
-            "DmlExecutionProvider",
-            "CPUExecutionProvider",
-        ]
-    else:  # Linux / other Unix
-        platform_order = [
-            "CUDAExecutionProvider",
-            "OpenVINOExecutionProvider",
-            "CPUExecutionProvider",
-        ]
+        if "CoreMLExecutionProvider" in available:
+            if force_coreml or not preferred_lower or preferred_lower in ("coreml", "coremlexecutionprovider"):
+                providers.append("CoreMLExecutionProvider")
 
-    for candidate in platform_order:
-        if candidate in available and candidate not in providers:
-            providers.append(candidate)
+    # 2. Windows DirectML Evaluation (or explicitly forced)
+    if "windows" in system or force_dml:
+        hw_adapters = get_hardware_adapters()
+        has_hw_adapters = len(hw_adapters) > 0
 
-    if "CPUExecutionProvider" not in providers:
+        if "DmlExecutionProvider" in available and (has_hw_adapters or force_dml):
+            target_device_id = dml_env_device_id if dml_env_device_id is not None else get_best_dml_device_id()
+            if target_device_id is not None:
+                providers.append(("DmlExecutionProvider", {"device_id": target_device_id}))
+            else:
+                providers.append("DmlExecutionProvider")
+
+    # 3. CUDA Evaluation (if requested or available and no GPU provider added yet)
+    if "CUDAExecutionProvider" in available:
+        existing_names = [p[0] if isinstance(p, tuple) else p for p in providers]
+        if force_cuda or (not force_dml and not force_coreml and "CUDAExecutionProvider" not in existing_names):
+            if force_cuda or not providers:
+                providers.append("CUDAExecutionProvider")
+
+    # 4. Other requested providers (OpenVINO, ROCm, CoreML, etc.) or Linux defaults
+    if target_preferred and not force_dml and not force_cuda and not force_coreml:
+        provider_aliases = {
+            "openvino": "OpenVINOExecutionProvider",
+            "rocm": "ROCMExecutionProvider",
+            "coreml": "CoreMLExecutionProvider",
+        }
+        matched = provider_aliases.get(preferred_lower, target_preferred)
+        existing_names = [p[0] if isinstance(p, tuple) else p for p in providers]
+        if matched in available and matched not in existing_names:
+            providers.insert(0, matched)
+
+    # On Linux / other Unix, if no accelerator provider selected yet, probe OpenVINO or ROCm
+    if "darwin" not in system and "windows" not in system and not target_preferred:
+        for candidate in ("OpenVINOExecutionProvider", "ROCMExecutionProvider"):
+            existing_names = [p[0] if isinstance(p, tuple) else p for p in providers]
+            if candidate in available and candidate not in existing_names:
+                providers.append(candidate)
+
+    # 5. Always append 'CPUExecutionProvider' as safety fallback
+    existing_names = [p[0] if isinstance(p, tuple) else p for p in providers]
+    if "CPUExecutionProvider" not in existing_names:
         providers.append("CPUExecutionProvider")
 
     return providers
@@ -123,7 +157,7 @@ class UniversalDecider:
         
         Args:
             model_dir: Directory containing model weights (defaults to ~/.cache/ngam/models/ngam_onnx)
-            preferred_provider: Explicit provider override ('dml', 'coreml', 'cuda', 'cpu')
+            preferred_provider: Explicit provider override ('dml', 'cpu', 'cuda', etc.)
             offline_mode: Disallow Hugging Face downloads if assets are missing
             custom_session: Optional pre-initialized ONNX session (useful for mocks/tests)
             custom_tokenizer: Optional pre-initialized Tokenizer
@@ -131,6 +165,10 @@ class UniversalDecider:
         """
         self.preferred_provider = preferred_provider
         self.offline_mode = offline_mode
+        self._session_lock = threading.Lock()
+        self._inference_lock = threading.RLock()
+        self._last_fallback_duration_ms: float = 0.0
+        self.active_provider: str = ""
         self.providers = resolve_providers(preferred_provider)
 
         if custom_session is not None:
@@ -186,24 +224,49 @@ class UniversalDecider:
             raise FileNotFoundError(f"Missing tokenizer at: {tok_path}")
         self.tokenizer = Tokenizer.from_file(str(tok_path))
 
+    def _create_cpu_session_options(self) -> ort.SessionOptions:
+        """Create unified SessionOptions optimized for CPU inference."""
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        logical_cores = os.cpu_count() or 4
+        sess_options.intra_op_num_threads = min(8, max(2, logical_cores // 2))
+        sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        return sess_options
+
     def _init_session(self) -> None:
         model_path = Path(self.model_dir) / "model.onnx"
         if not model_path.is_file():
             raise FileNotFoundError(f"Missing ONNX model graph at: {model_path}")
 
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # DirectML SessionOptions mandatory invariants
+        is_dml_requested = any(
+            (p == "DmlExecutionProvider" or (isinstance(p, tuple) and p[0] == "DmlExecutionProvider"))
+            for p in self.providers
+        )
+        if is_dml_requested:
+            sess_options = ort.SessionOptions()
+            sess_options.enable_mem_pattern = False
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        else:
+            sess_options = self._create_cpu_session_options()
 
-        # Attempt initialization with probed providers (Dml / CoreML / CUDA -> CPU fallback)
+        # Attempt initialization with probed providers
+        active_providers = self.providers
+        if active_providers and active_providers[0] == "CPUExecutionProvider":
+            active_providers = ["CPUExecutionProvider"]
+            sess_options = self._create_cpu_session_options()
+
         try:
             self.session = ort.InferenceSession(
                 str(model_path),
                 sess_options=sess_options,
-                providers=self.providers,
+                providers=active_providers,
             )
             self.active_provider = self.session.get_providers()[0]
 
-            # Preflight verification if non-CPU provider was selected
+            # Pre-flight verification warmup if a non-CPU provider was selected
             if self.active_provider != "CPUExecutionProvider":
                 try:
                     seq_ids, marker_pos = self._build_sequence(
@@ -212,42 +275,76 @@ class UniversalDecider:
                         qtype="choice",
                         options=[("a", "a"), ("b", "b")],
                     )
-                    input_ids = np.array([seq_ids], dtype=np.int64)
-                    attention_mask = np.ones((1, len(seq_ids)), dtype=np.int64)
-                    marker_pos_arr = np.array([marker_pos], dtype=np.int64)
-                    marker_mask = np.ones((1, len(marker_pos)), dtype=bool)
-                    qtype_arr = np.array([0], dtype=np.int64)
-                    self.session.run(None, {
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                        "marker_pos": marker_pos_arr,
-                        "marker_mask": marker_mask,
-                        "qtype": qtype_arr,
-                    })
+                    k = len(marker_pos)
+                    inputs = {
+                        "input_ids": np.array([seq_ids], dtype=np.int64),
+                        "attention_mask": np.ones((1, len(seq_ids)), dtype=np.int64),
+                        "marker_pos": np.array([marker_pos], dtype=np.int64),
+                        "marker_mask": np.ones((1, k), dtype=bool),
+                        "qtype": np.array([0], dtype=np.int64),
+                    }
+                    with self._inference_lock:
+                        self.session.run(None, inputs)
                     logger.info(f"Verified active provider: {self.active_provider}")
-                except Exception as probe_err:
-                    logger.info(f"Provider {self.active_provider} failed pre-flight verification ({probe_err}); falling back to CPUExecutionProvider.")
+                except Exception as warmup_err:
+                    logger.warning(
+                        f"Provider '{self.active_provider}' failed pre-flight warmup ({warmup_err}). "
+                        f"Falling back to CPUExecutionProvider."
+                    )
                     self._fallback_to_cpu()
             else:
                 logger.info(f"Initialized ngam ONNX session with provider: {self.active_provider}")
         except Exception as err:
             logger.warning(
-                f"Failed to initialize session with requested providers {self.providers}: {err}. "
+                f"Failed to initialize session with requested providers {active_providers}: {err}. "
                 f"Falling back to CPUExecutionProvider."
             )
             self._fallback_to_cpu()
 
     def _fallback_to_cpu(self) -> None:
-        """Fallback session to CPUExecutionProvider."""
-        model_path = Path(self.model_dir) / "model.onnx"
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.session = ort.InferenceSession(
-            str(model_path),
-            sess_options=sess_options,
-            providers=["CPUExecutionProvider"],
-        )
-        self.active_provider = "CPUExecutionProvider"
+        """
+        Thread-safe, telemetry-isolated fallback to CPUExecutionProvider.
+        Employs double-checked locking with self._session_lock.
+        """
+        if self.active_provider == "CPUExecutionProvider":
+            return
+
+        with self._inference_lock:
+            with self._session_lock:
+                # Double-checked locking
+                if self.active_provider == "CPUExecutionProvider":
+                    return
+
+                t0 = time.perf_counter()
+                model_path = Path(self.model_dir) / "model.onnx"
+                if not model_path.is_file():
+                    self.session = None
+                    self.active_provider = ""
+                    err = FileNotFoundError(f"Missing ONNX model graph for fallback at: {model_path}")
+                    logger.error(str(err))
+                    raise err
+
+                sess_options = self._create_cpu_session_options()
+
+                try:
+                    new_session = ort.InferenceSession(
+                        str(model_path),
+                        sess_options=sess_options,
+                        providers=["CPUExecutionProvider"],
+                    )
+                    self.session = new_session
+                    self.active_provider = "CPUExecutionProvider"
+                except Exception as cpu_init_err:
+                    self.session = None
+                    self.active_provider = ""
+                    logger.error(f"CPU fallback session initialization failed: {cpu_init_err}")
+                    raise cpu_init_err
+
+                t1 = time.perf_counter()
+                self._last_fallback_duration_ms = (t1 - t0) * 1000.0
+                logger.warning(
+                    f"Fallback to CPUExecutionProvider completed in {self._last_fallback_duration_ms:.2f}ms"
+                )
 
     def tokenize(self, text: str) -> List[int]:
         """Convert raw text to token ID sequence without special boundary tokens."""
@@ -352,17 +449,54 @@ class UniversalDecider:
             "qtype": np.array([qtype_code], dtype=np.int64),
         }
 
+        with self._session_lock:
+            sess = self.session
+            active_prov = self.active_provider
+
+        if sess is None:
+            raise RuntimeError("Engine session unavailable (initialization or fallback failed); refusing fail-closed.")
+
+        providers = sess.get_providers() if hasattr(sess, "get_providers") else [active_prov]
+        is_dml = ("DmlExecutionProvider" in providers) or (active_prov == "DmlExecutionProvider")
         t0 = time.perf_counter()
         try:
-            outputs = self.session.run(None, inputs)
+            if is_dml:
+                with self._inference_lock:
+                    with self._session_lock:
+                        if self.session is not sess:
+                            sess = self.session
+                    if sess is None:
+                        raise RuntimeError("Engine session unavailable; refusing fail-closed.")
+                    outputs = sess.run(None, inputs)
+            else:
+                with self._session_lock:
+                    if self.session is not sess:
+                        sess = self.session
+                if sess is None:
+                    raise RuntimeError("Engine session unavailable; refusing fail-closed.")
+                outputs = sess.run(None, inputs)
         except Exception as run_err:
-            if self.active_provider != "CPUExecutionProvider":
+            if active_prov != "CPUExecutionProvider":
+                err_type_name = type(run_err).__name__.lower()
+                err_str = str(run_err).lower()
+                is_caller_error = (
+                    isinstance(run_err, (ValueError, TypeError, IndexError))
+                    or "invalidargument" in err_type_name
+                    or "invalid argument" in err_str
+                )
+                if is_caller_error:
+                    raise run_err
                 logger.warning(
-                    f"Execution failed on provider '{self.active_provider}': {run_err}. "
-                    f"Falling back to CPUExecutionProvider."
+                    f"Execution failed on provider '{active_prov}': {run_err}. "
+                    f"Falling back to CPUExecutionProvider and retrying inference."
                 )
                 self._fallback_to_cpu()
-                outputs = self.session.run(None, inputs)
+                with self._session_lock:
+                    sess = self.session
+                if sess is None:
+                    raise RuntimeError("Engine session unavailable (initialization or fallback failed); refusing fail-closed.")
+                t0 = time.perf_counter()
+                outputs = sess.run(None, inputs)
             else:
                 raise run_err
 
@@ -381,6 +515,53 @@ class UniversalDecider:
             act_probability = float(act_probs[0])
 
         return raw_scores, act_probability, latency_ms
+
+    def _run_inference(
+        self,
+        prompt: str,
+        qtype: Literal["choice", "score", "noul"] | str | int = "choice",
+        options: Sequence[Tuple[str, str]] | List[str] | Dict[str, str] | None = None,
+        question: Optional[str] = None,
+    ) -> Tuple[np.ndarray, Optional[float], float]:
+        """
+        Execute inference for prompt, qtype, and options with automatic DML-to-CPU fallback.
+        """
+        int_to_qtype = {0: "choice", 1: "score", 2: "noul"}
+        if isinstance(qtype, int):
+            qtype_str = int_to_qtype.get(qtype, "choice")
+            qtype_code = qtype
+        else:
+            qtype_str = str(qtype).lower().strip()
+            qtype_map = {"choice": 0, "score": 1, "noul": 2}
+            qtype_code = qtype_map.get(qtype_str, 0)
+
+        opt_pairs: List[Tuple[str, str]] = []
+        if isinstance(options, dict):
+            opt_pairs = list(options.items())
+        elif isinstance(options, list):
+            if options and isinstance(options[0], tuple):
+                opt_pairs = options  # type: ignore
+            else:
+                opt_pairs = [(str(opt), str(opt)) for opt in options]
+        elif options is None:
+            if qtype_str == "noul":
+                opt_pairs = [("false", "no, the statement does not hold"), ("true", "yes, the statement holds")]
+            else:
+                opt_pairs = [("opt0", "Option 0"), ("opt1", "Option 1")]
+        else:
+            opt_pairs = [(str(options), str(options))]
+
+        q_text = question or (f"Evaluate {qtype_str}" if qtype_str != "noul" else prompt)
+        valid_qtype: Literal["choice", "score", "noul"] = (
+            qtype_str if qtype_str in ("choice", "score", "noul") else "choice"  # type: ignore
+        )
+        token_ids, marker_positions = self._build_sequence(
+            prompt=prompt,
+            question=q_text,
+            qtype=valid_qtype,
+            options=opt_pairs,
+        )
+        return self._execute_forward(token_ids, marker_positions, qtype_code)
 
     def decide_choice(
         self,
@@ -438,6 +619,7 @@ class UniversalDecider:
             rejection_reason=rejection_r,
             act_probability=round(act_prob, 4) if act_prob is not None else None,
             latency_ms=round(latency, 2),
+            tokens_used=len(tokens),
             provider=self.active_provider,
         )
 
@@ -499,6 +681,7 @@ class UniversalDecider:
             rejection_reason=rejection_r,
             act_probability=round(act_prob, 4) if act_prob is not None else None,
             latency_ms=round(latency, 2),
+            tokens_used=len(tokens),
             provider=self.active_provider,
         )
 
@@ -553,6 +736,7 @@ class UniversalDecider:
             rejection_reason=rejection_r,
             act_probability=round(act_prob, 4) if act_prob is not None else None,
             latency_ms=round(latency, 2),
+            tokens_used=len(tokens),
             provider=self.active_provider,
         )
 
@@ -576,13 +760,13 @@ class UniversalDecider:
                 parsed_choice = choice
 
             res = self.decide_choice(prompt=prompt, options=parsed_choice, question=question)
-            return DecisionResult(
+            return build_decision_result(
                 prompt=prompt,
                 decision=res,
                 latency_ms=res.latency_ms,
                 provider=res.provider,
                 model_name=self.config.get("model_name", "ngam-onnx"),
-                tokens_used=len(self.tokenize(prompt)) if self.tokenizer else 0,
+                tokens_used=res.tokens_used,
                 is_ambiguous=res.ambiguous,
                 is_out_of_domain=res.is_out_of_domain,
                 rejection_reason=res.rejection_reason,
@@ -611,13 +795,13 @@ class UniversalDecider:
                 criteria=crit_list,
                 question=question,
             )
-            return DecisionResult(
+            return build_decision_result(
                 prompt=prompt,
                 decision=res,
                 latency_ms=res.latency_ms,
                 provider=res.provider,
                 model_name=self.config.get("model_name", "ngam-onnx"),
-                tokens_used=len(self.tokenize(prompt)) if self.tokenizer else 0,
+                tokens_used=res.tokens_used,
                 is_ambiguous=res.ambiguous,
                 is_out_of_domain=res.is_out_of_domain,
                 rejection_reason=res.rejection_reason,
@@ -625,13 +809,13 @@ class UniversalDecider:
 
         if noul is not None:
             res = self.decide_noul(prompt=prompt, statement=noul)
-            return DecisionResult(
+            return build_decision_result(
                 prompt=prompt,
                 decision=res,
                 latency_ms=res.latency_ms,
                 provider=res.provider,
                 model_name=self.config.get("model_name", "ngam-onnx"),
-                tokens_used=len(self.tokenize(prompt)) if self.tokenizer else 0,
+                tokens_used=res.tokens_used,
                 is_ambiguous=res.ambiguous,
                 is_out_of_domain=res.is_out_of_domain,
                 rejection_reason=res.rejection_reason,
