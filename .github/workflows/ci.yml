@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     name: Test on ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    if: ${{ env.ACT == 'true' || env.ACT == true }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
